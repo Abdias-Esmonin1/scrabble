@@ -594,6 +594,10 @@ function roomPeerId(code){
   return 'scrabble-'+code.toLowerCase()+'-host';
 }
 
+function roomPeerIds(code){
+  return [roomPeerId(code), code.toUpperCase()+'_host'];
+}
+
 function shuffle(a){
   for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}
   return a;
@@ -629,7 +633,7 @@ function joinRoom(){
   document.getElementById('displayCode').textContent=state.room;
   document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Recherche de la partie...';
   showScreen('waitingScreen');
-  initPeer(null,roomPeerId(code));
+  initPeer(null,roomPeerIds(code));
 }
 
 function cancelWait(){
@@ -656,15 +660,8 @@ function initPeer(myPeerId,connectTo){
   peer=new Peer(myPeerId,PEER_OPTIONS);
   peer.on('open',()=>{
     if(connectTo){
-      document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Connexion à '+state.room+'...';
-      conn=peer.connect(connectTo,{reliable:true});
-      setupConn(conn);
-      joinTimeout=setTimeout(()=>{
-        if(!conn||!conn.open){
-          document.getElementById('lobbyErr').textContent='Salle introuvable. Vérifie le code ou demande à ton ami de recréer la salle.';
-          cancelWait();
-        }
-      },12000);
+      const targets=Array.isArray(connectTo)?connectTo:[connectTo];
+      tryConnectTarget(targets,0);
     } else {
       document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Salle prête. En attente d\'un adversaire...';
     }
@@ -680,7 +677,21 @@ function initPeer(myPeerId,connectTo){
   });
 }
 
-function setupConn(c){
+function tryConnectTarget(targets,index){
+  if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
+  if(index>=targets.length){
+    document.getElementById('lobbyErr').textContent='Salle introuvable. Vérifie le code, recharge les deux pages avec Ctrl + F5, puis recrée une salle.';
+    cancelWait();
+    return;
+  }
+  if(conn)conn.close();
+  document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Connexion à '+state.room+'...';
+  conn=peer.connect(targets[index],{reliable:true});
+  setupConn(conn,()=>tryConnectTarget(targets,index+1));
+  joinTimeout=setTimeout(()=>tryConnectTarget(targets,index+1),8000);
+}
+
+function setupConn(c,onConnectError){
   c.on('open',()=>{
     if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
     document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Adversaire connecté. Lancement...';
@@ -689,6 +700,7 @@ function setupConn(c){
   c.on('data',handleMsg);
   c.on('error',()=>{
     if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
+    if(onConnectError){onConnectError();return;}
     document.getElementById('lobbyErr').textContent='Connexion à la salle impossible. Vérifie le code et réessaie.';
     showScreen('lobbyScreen');
   });
