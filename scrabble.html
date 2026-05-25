@@ -4,7 +4,7 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Scrabble en ligne</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@500&display=swap');
 
@@ -552,32 +552,41 @@ const BONUS={
 
 const BONUS_LABELS={tw:'M x3',dw:'M x2',tl:'L x3',dl:'L x2',center:'*'};
 
-let state={
-  board:Array(15).fill(null).map(()=>Array(15).fill(null)),
-  bag:[],turn:null,
-  myId:null,myName:'',oppId:null,oppName:'',
-  isHost:false,room:'',
-  rack:[],placed:[],
-  selectedTileIdx:-1,
-  scores:{}
-};
-let peer,conn;
-let draggedTileIdx=-1;
-let joinTimeout=null;
+const SUPABASE_URL='REMPLACE_PAR_TON_SUPABASE_URL';
+const SUPABASE_ANON_KEY='REMPLACE_PAR_TON_SUPABASE_ANON_KEY';
+const TURN_SECONDS=180;
 
-const PEER_OPTIONS={
-  host:'0.peerjs.com',
-  port:443,
-  path:'/',
-  secure:true,
-  config:{
-    iceServers:[
-      {urls:'stun:stun.l.google.com:19302'},
-      {urls:'stun:global.stun.twilio.com:3478'}
-    ]
-  },
-  debug:1
-};
+const playerId=localStorage.getItem('scrabblePlayerId')||crypto.randomUUID();
+localStorage.setItem('scrabblePlayerId',playerId);
+let state=initialState();
+let draggedTileIdx=-1;
+let roomChannel=null;
+let turnTimer=null;
+let currentRoomRow=null;
+let autoPassing=false;
+
+function initialState(){
+  return {
+    board:Array(15).fill(null).map(()=>Array(15).fill(null)),
+    bag:[],turn:null,
+    myId:playerId,myName:'',oppId:null,oppName:'',
+    isHost:false,room:'',
+    rack:[],placed:[],
+    selectedTileIdx:-1,
+    scores:{},
+    turnEndsAt:null,
+    chat:[]
+  };
+}
+
+function getSupabase(){
+  if(SUPABASE_URL.includes('REMPLACE')||SUPABASE_ANON_KEY.includes('REMPLACE')){
+    throw new Error('Configuration Supabase manquante dans scrabble.html.');
+  }
+  return window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
+}
+
+const db=(()=>{try{return getSupabase();}catch(e){return null;}})();
 
 function showScreen(id){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
@@ -588,14 +597,6 @@ function genCode(){
   const c='ABCDEFGHJKLMNPQRSTUVWXYZ';
   let r='';for(let i=0;i<4;i++)r+=c[Math.floor(Math.random()*c.length)];
   return r;
-}
-
-function roomPeerId(code){
-  return 'scrabble-'+code.toLowerCase()+'-host';
-}
-
-function roomPeerIds(code){
-  return [roomPeerId(code), code.toUpperCase()+'_host'];
 }
 
 function shuffle(a){
@@ -609,9 +610,50 @@ function drawTiles(n){
   return d;
 }
 
-function createRoom(){
+function makeGame(code,name){
+  return {
+    code,
+    started:false,
+    hostId:playerId,
+    players:[{id:playerId,name}],
+    board:Array(15).fill(null).map(()=>Array(15).fill(null)),
+    bag:[],
+    racks:{},
+    scores:{[playerId]:0},
+    turn:null,
+    turnEndsAt:null,
+    chat:[{from:'Système',text:'Salle créée.'}]
+  };
+}
+
+function startGameData(game){
+  const bag=shuffle([...FR_TILES]);
+  const p1=game.players[0];
+  const p2=game.players[1];
+  game.started=true;
+  game.bag=bag;
+  game.racks[p1.id]=bag.splice(0,7);
+  game.racks[p2.id]=bag.splice(0,7);
+  game.scores[p1.id]=0;
+  game.scores[p2.id]=0;
+  game.turn=p1.id;
+  game.turnEndsAt=nextTurnEndsAt();
+  game.chat=[...(game.chat||[]),{from:'Système',text:'La partie commence.'}];
+  return game;
+}
+
+function nextTurnEndsAt(){
+  return new Date(Date.now()+TURN_SECONDS*1000).toISOString();
+}
+
+function showConfigError(){
+  document.getElementById('lobbyErr').textContent='Supabase n’est pas configuré. Mets SUPABASE_URL et SUPABASE_ANON_KEY dans scrabble.html.';
+}
+
+async function createRoom(){
   const name=document.getElementById('nameInput').value.trim();
   if(!name){document.getElementById('lobbyErr').textContent='Entre ton prénom.';return;}
+  if(!db){showConfigError();return;}
   document.getElementById('lobbyErr').textContent='';
   state.myName=name;state.isHost=true;
   state.room=genCode();
@@ -619,29 +661,52 @@ function createRoom(){
   document.getElementById('displayCode').textContent=state.room;
   document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Connexion au serveur...';
   showScreen('waitingScreen');
-  initPeer(roomPeerId(state.room));
+  const {error}=await db.from('scrabble_rooms').insert({code:state.room,game:makeGame(state.room,name)});
+  if(error){
+    document.getElementById('lobbyErr').textContent='Création impossible : '+error.message;
+    showScreen('lobbyScreen');
+    return;
+  }
+  subscribeRoom(state.room);
+  document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Salle prête. En attente d\'un adversaire...';
 }
 
-function joinRoom(){
+async function joinRoom(){
   const name=document.getElementById('nameInput').value.trim();
   const code=document.getElementById('codeInput').value.trim().toUpperCase();
   if(!name){document.getElementById('lobbyErr').textContent='Entre ton prénom.';return;}
   if(code.length<2){document.getElementById('lobbyErr').textContent='Entre le code de la salle.';return;}
+  if(!db){showConfigError();return;}
   document.getElementById('lobbyErr').textContent='';
   state.myName=name;state.isHost=false;state.room=code;
   document.getElementById('waitingTitle').textContent='Connexion à la salle...';
   document.getElementById('displayCode').textContent=state.room;
   document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Recherche de la partie...';
   showScreen('waitingScreen');
-  initPeer(null,roomPeerIds(code));
-}
-
-function cancelWait(){
-  if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
-  if(conn)conn.close();
-  if(peer)peer.destroy();
-  conn=null;peer=null;
-  showScreen('lobbyScreen');
+  const {data,error}=await db.from('scrabble_rooms').select('*').eq('code',code).single();
+  if(error||!data){
+    document.getElementById('lobbyErr').textContent='Salle introuvable. Vérifie le code.';
+    showScreen('lobbyScreen');
+    return;
+  }
+  const game=data.game;
+  if(!game.players.some(p=>p.id===playerId)){
+    if(game.players.length>=2){
+      document.getElementById('lobbyErr').textContent='Cette salle est déjà complète.';
+      showScreen('lobbyScreen');
+      return;
+    }
+    game.players.push({id:playerId,name});
+    startGameData(game);
+    const {error:updateError}=await db.from('scrabble_rooms').update({game,updated_at:new Date().toISOString()}).eq('code',code);
+    if(updateError){
+      document.getElementById('lobbyErr').textContent='Connexion impossible : '+updateError.message;
+      showScreen('lobbyScreen');
+      return;
+    }
+  }
+  subscribeRoom(code);
+  applyRemoteGame(game);
 }
 
 function copyCode(){
@@ -652,112 +717,67 @@ function copyCode(){
   setTimeout(()=>btn.textContent='Copier le code',1500);
 }
 
-function initPeer(myPeerId,connectTo){
-  if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
-  if(conn)conn.close();
-  if(peer)peer.destroy();
-  conn=null;
-  peer=new Peer(myPeerId,PEER_OPTIONS);
-  peer.on('open',()=>{
-    if(connectTo){
-      const targets=Array.isArray(connectTo)?connectTo:[connectTo];
-      tryConnectTarget(targets,0);
-    } else {
-      document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Salle prête. En attente d\'un adversaire...';
-    }
-  });
-  peer.on('connection',c=>{conn=c;setupConn(c);});
-  peer.on('error',err=>{
-    if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
-    const msg=err&&err.type==='unavailable-id'
-      ? 'Ce code est déjà utilisé. Crée une nouvelle partie.'
-      : 'Connexion impossible ('+(err&&err.type?err.type:'erreur réseau')+'). Vérifie le code.';
-    document.getElementById('lobbyErr').textContent=msg;
-    showScreen('lobbyScreen');
-  });
+function cancelWait(){
+  unsubscribeRoom();
+  showScreen('lobbyScreen');
 }
 
-function tryConnectTarget(targets,index){
-  if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
-  if(index>=targets.length){
-    document.getElementById('lobbyErr').textContent='Salle introuvable. Vérifie le code, recharge les deux pages avec Ctrl + F5, puis recrée une salle.';
-    cancelWait();
+function subscribeRoom(code){
+  unsubscribeRoom();
+  roomChannel=db.channel('scrabble-room-'+code)
+    .on('postgres_changes',{event:'UPDATE',schema:'public',table:'scrabble_rooms',filter:'code=eq.'+code},payload=>{
+      applyRemoteGame(payload.new.game);
+    })
+    .subscribe(status=>{
+      const connected=status==='SUBSCRIBED';
+      document.getElementById('connDot').className=connected?'dot':'dot waiting';
+      document.getElementById('connLabel').textContent=connected?'Connecté':'Synchronisation...';
+    });
+}
+
+function unsubscribeRoom(){
+  if(roomChannel&&db)db.removeChannel(roomChannel);
+  roomChannel=null;
+  if(turnTimer){clearInterval(turnTimer);turnTimer=null;}
+}
+
+async function saveGame(game){
+  currentRoomRow={code:game.code,game};
+  const {error}=await db.from('scrabble_rooms').update({game,updated_at:new Date().toISOString()}).eq('code',game.code);
+  if(error)addChat('Système','Sauvegarde impossible : '+error.message);
+}
+
+function applyRemoteGame(game){
+  currentRoomRow={code:game.code,game:structuredClone(game)};
+  const me=game.players.find(p=>p.id===playerId);
+  const opp=game.players.find(p=>p.id!==playerId);
+  state.board=game.board;
+  state.bag=game.bag||[];
+  state.turn=game.turn;
+  state.myId=playerId;
+  state.myName=me?me.name:state.myName;
+  state.oppId=opp?opp.id:null;
+  state.oppName=opp?opp.name:'Adversaire';
+  state.isHost=game.hostId===playerId;
+  state.room=game.code;
+  state.rack=(game.racks&&game.racks[playerId])?game.racks[playerId]:[];
+  state.scores=game.scores||{};
+  state.turnEndsAt=game.turnEndsAt||null;
+  state.chat=game.chat||[];
+  state.placed=[];state.selectedTileIdx=-1;
+  if(!game.started){
+    document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Salle prête. En attente d\'un adversaire...';
     return;
   }
-  if(conn)conn.close();
-  document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Connexion à '+state.room+'...';
-  conn=peer.connect(targets[index],{reliable:true});
-  setupConn(conn,()=>tryConnectTarget(targets,index+1));
-  joinTimeout=setTimeout(()=>tryConnectTarget(targets,index+1),8000);
-}
-
-function setupConn(c,onConnectError){
-  c.on('open',()=>{
-    if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
-    document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Adversaire connecté. Lancement...';
-    c.send({type:'hello',name:state.myName});
-  });
-  c.on('data',handleMsg);
-  c.on('error',()=>{
-    if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
-    if(onConnectError){onConnectError();return;}
-    document.getElementById('lobbyErr').textContent='Connexion à la salle impossible. Vérifie le code et réessaie.';
-    showScreen('lobbyScreen');
-  });
-  c.on('close',()=>{
-    document.getElementById('connDot').className='dot waiting';
-    document.getElementById('connLabel').textContent='Déconnecté';
-    addChat('Système','Adversaire déconnecté');
-  });
-}
-
-function handleMsg(msg){
-  if(msg.type==='hello'){
-    state.oppName=msg.name;
-    if(state.isHost){
-      const bag=shuffle([...FR_TILES]);
-      state.bag=bag;
-      const myRack=bag.splice(0,7);
-      const oppRack=bag.splice(0,7);
-      state.rack=myRack;
-      state.scores[state.myName]=0;
-      state.scores[state.oppName]=0;
-      state.turn=state.myName;
-      conn.send({type:'start',oppRack,bag:[...state.bag],turn:state.myName,hostName:state.myName,guestName:state.oppName});
-      startGame();
-    }
-  }
-  if(msg.type==='start'){
-    state.rack=msg.oppRack;
-    state.bag=msg.bag;
-    state.turn=msg.turn;
-    state.scores[msg.hostName]=0;
-    state.scores[msg.guestName]=0;
-    state.oppName=msg.hostName;
-    startGame();
-  }
-  if(msg.type==='move'){
-    msg.cells.forEach(({r,c,tile})=>{state.board[r][c]=tile;});
-    state.scores[state.oppName]=(state.scores[state.oppName]||0)+msg.score;
-    state.bag=msg.bag;
-    state.turn=state.myName;
-    renderBoard();updateUI();
-    addChat('Système',state.oppName+' a joué un mot (+'+msg.score+' pts)');
-  }
-  if(msg.type==='pass'){
-    state.turn=state.myName;updateUI();
-    addChat('Système',state.oppName+' a passé son tour.');
-  }
-  if(msg.type==='chat')addChat(state.oppName,msg.text);
+  startGame();
 }
 
 function startGame(){
-  state.placed=[];state.selectedTileIdx=-1;
   document.getElementById('gameCodeTag').textContent=state.room;
   document.getElementById('myNameDisp').textContent=state.myName;
   document.getElementById('oppNameDisp').textContent=state.oppName;
   showScreen('gameScreen');
-  renderBoard();renderRack();updateUI();
+  renderBoard();renderRack();renderChat();updateUI();startTurnTimer();
 }
 
 function renderBoard(){
@@ -801,7 +821,7 @@ function renderRack(){
     el.className='tile'+(tile.l===''?' blank':'')+(i===state.selectedTileIdx?' selected':'');
     el.innerHTML=(tile.l||'*')+'<span class="tile-score">'+tile.v+'</span>';
     el.onclick=()=>selectTile(i);
-    el.draggable=state.turn===state.myName;
+    el.draggable=state.turn===playerId;
     el.dataset.tileIndex=i;
     el.ondragstart=e=>startTileDrag(e,i);
     el.ondragend=e=>endTileDrag(e);
@@ -810,7 +830,7 @@ function renderRack(){
 }
 
 function startTileDrag(e,i){
-  if(state.turn!==state.myName){e.preventDefault();return;}
+  if(state.turn!==playerId){e.preventDefault();return;}
   draggedTileIdx=i;
   state.selectedTileIdx=i;
   e.currentTarget.classList.add('dragging');
@@ -826,7 +846,7 @@ function endTileDrag(e){
 }
 
 function handleCellDragOver(e){
-  if(state.turn!==state.myName)return;
+  if(state.turn!==playerId)return;
   e.preventDefault();
   e.dataTransfer.dropEffect='move';
 }
@@ -840,13 +860,13 @@ function dropOnCell(e,r,c){
 }
 
 function selectTile(i){
-  if(state.turn!==state.myName)return;
+  if(state.turn!==playerId)return;
   state.selectedTileIdx=(state.selectedTileIdx===i)?-1:i;
   renderRack();
 }
 
 function placeOnCell(r,c,tileIdx=state.selectedTileIdx){
-  if(state.turn!==state.myName)return;
+  if(state.turn!==playerId)return;
   if(tileIdx<0){document.getElementById('infoRow').textContent='Sélectionne d\'abord une lettre ou glisse-la sur le plateau.';return;}
   if(!state.rack[tileIdx])return;
   if(state.placed.find(p=>p.r===r&&p.c===c))return;
@@ -893,65 +913,101 @@ function recallTiles(){
   document.getElementById('infoRow').textContent='';
 }
 
-function playWord(){
+async function playWord(){
   if(!state.placed.length)return;
+  if(state.turn!==playerId)return;
+  const game=structuredClone(currentRoomRow.game);
   const score=calcScore();
-  state.scores[state.myName]=(state.scores[state.myName]||0)+score;
-  state.placed.forEach(({r,c,tile})=>{state.board[r][c]=tile;});
-  const cells=state.placed.map(p=>({r:p.r,c:p.c,tile:p.tile}));
-  const n=7-state.rack.length;
-  state.rack=[...state.rack,...drawTiles(n)];
+  state.placed.forEach(({r,c,tile})=>{game.board[r][c]=tile;});
+  game.scores[playerId]=(game.scores[playerId]||0)+score;
+  game.bag=state.bag;
+  game.racks[playerId]=state.rack;
+  const n=7-game.racks[playerId].length;
+  for(let i=0;i<n&&game.bag.length;i++)game.racks[playerId].push(game.bag.pop());
+  game.turn=state.oppId;
+  game.turnEndsAt=nextTurnEndsAt();
+  game.chat=[...(game.chat||[]),{from:'Système',text:state.myName+' a joué (+'+score+' pts)'}];
   state.placed=[];state.selectedTileIdx=-1;
-  state.turn=state.oppName;
-  conn.send({type:'move',cells,score,bag:[...state.bag]});
-  renderBoard();renderRack();updateUI();
-  addChat('Système','Tu as joué (+'+score+' pts)');
+  await saveGame(game);
 }
 
-function passTurn(){
-  if(state.turn!==state.myName)return;
+async function passTurn(){
+  if(state.turn!==playerId)return;
   recallTiles();
-  state.turn=state.oppName;
-  conn.send({type:'pass'});
-  updateUI();
-  addChat('Système','Tu as passé ton tour.');
+  const game=structuredClone(currentRoomRow.game);
+  game.racks[playerId]=state.rack;
+  game.turn=state.oppId;
+  game.turnEndsAt=nextTurnEndsAt();
+  game.chat=[...(game.chat||[]),{from:'Système',text:state.myName+' a passé son tour.'}];
+  await saveGame(game);
 }
 
 function updateUI(){
-  const my=state.turn===state.myName;
+  const my=state.turn===playerId;
   const badge=document.getElementById('turnBadge');
   badge.textContent=my?'Ton tour !':'Tour de '+state.oppName;
   badge.className='turn-badge'+(my?' my':'');
-  document.getElementById('myScore').textContent=state.scores[state.myName]||0;
-  document.getElementById('oppScore').textContent=state.scores[state.oppName]||0;
+  document.getElementById('myScore').textContent=state.scores[playerId]||0;
+  document.getElementById('oppScore').textContent=state.scores[state.oppId]||0;
   document.getElementById('btnPlay').disabled=!my||!state.placed.length;
-  document.getElementById('infoRow').textContent=state.bag.length+' lettres restantes dans le sac';
+  updateTimerText();
 }
 
-function addChat(from,text){
+function updateTimerText(){
+  const seconds=state.turnEndsAt?Math.max(0,Math.ceil((new Date(state.turnEndsAt)-Date.now())/1000)):0;
+  const min=String(Math.floor(seconds/60)).padStart(2,'0');
+  const sec=String(seconds%60).padStart(2,'0');
+  document.getElementById('infoRow').textContent=state.bag.length+' lettres restantes dans le sac | Temps : '+min+':'+sec;
+  if(seconds===0&&state.turn===playerId&&currentRoomRow&&!autoPassing){
+    autoPassing=true;
+    passTurn().finally(()=>{autoPassing=false;});
+  }
+}
+
+function startTurnTimer(){
+  if(turnTimer)clearInterval(turnTimer);
+  updateTimerText();
+  turnTimer=setInterval(updateTimerText,1000);
+}
+
+function addChat(from,text,persist=false){
   const box=document.getElementById('chatBox');
   const d=document.createElement('div');
   d.className='chat-msg';
   d.innerHTML='<span class="chat-from">'+from+'</span> : '+text;
   box.appendChild(d);
   box.scrollTop=box.scrollHeight;
+  if(persist&&currentRoomRow){
+    const game=structuredClone(currentRoomRow.game);
+    game.chat=[...(game.chat||[]),{from,text}];
+    saveGame(game);
+  }
+}
+
+function renderChat(){
+  const box=document.getElementById('chatBox');
+  box.innerHTML='';
+  (state.chat||[]).slice(-60).forEach(msg=>{
+    const d=document.createElement('div');
+    d.className='chat-msg';
+    d.innerHTML='<span class="chat-from">'+msg.from+'</span> : '+msg.text;
+    box.appendChild(d);
+  });
+  box.scrollTop=box.scrollHeight;
 }
 
 function sendChat(){
   const inp=document.getElementById('chatInput');
   const t=inp.value.trim();
-  if(!t||!conn)return;
-  conn.send({type:'chat',text:t});
-  addChat('Toi',t);
+  if(!t||!currentRoomRow)return;
+  addChat(state.myName,t,true);
   inp.value='';
 }
 
 function leaveGame(){
-  if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
-  if(conn)conn.close();
-  if(peer)peer.destroy();
-  state={board:Array(15).fill(null).map(()=>Array(15).fill(null)),bag:[],turn:null,myId:null,myName:'',oppId:null,oppName:'',isHost:false,room:'',rack:[],placed:[],selectedTileIdx:-1,scores:{}};
-  peer=null;conn=null;
+  unsubscribeRoom();
+  state=initialState();
+  currentRoomRow=null;
   showScreen('lobbyScreen');
 }
 </script>
