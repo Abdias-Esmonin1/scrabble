@@ -510,6 +510,7 @@ body{
       <div class="panel actions">
         <button class="btn-action" id="btnPlay" onclick="playWord()" disabled>Valider le mot</button>
         <button class="btn-action btn-pass" onclick="passTurn()">⏭ Passer mon tour</button>
+        <button class="btn-action btn-pass" onclick="exchangeSelectedTiles()">Échanger la sélection</button>
         <button class="btn-action btn-recall" onclick="recallTiles()">Rappeler les lettres</button>
       </div>
       <div class="panel">
@@ -555,6 +556,7 @@ const BONUS_LABELS={tw:'M x3',dw:'M x2',tl:'L x3',dl:'L x2',center:'*'};
 const SUPABASE_URL='https://ljdirfcxnvqsmdxzflad.supabase.co';
 const SUPABASE_ANON_KEY='sb_publishable_NEwEz6jFXMRqMgkvRlSDsQ_h8reR4Co';
 const TURN_SECONDS=180;
+const DICTIONARY_URL='https://cdn.jsdelivr.net/npm/an-array-of-french-words@2.0.0/index.json';
 
 const playerId=localStorage.getItem('scrabblePlayerId')||crypto.randomUUID();
 localStorage.setItem('scrabblePlayerId',playerId);
@@ -564,6 +566,8 @@ let roomChannel=null;
 let turnTimer=null;
 let currentRoomRow=null;
 let autoPassing=false;
+let dictionaryWords=null;
+let dictionaryPromise=null;
 
 function initialState(){
   return {
@@ -575,7 +579,10 @@ function initialState(){
     selectedTileIdx:-1,
     scores:{},
     turnEndsAt:null,
-    chat:[]
+    chat:[],
+    passCount:0,
+    gameOver:false,
+    winner:null
   };
 }
 
@@ -622,6 +629,9 @@ function makeGame(code,name){
     scores:{[playerId]:0},
     turn:null,
     turnEndsAt:null,
+    passCount:0,
+    gameOver:false,
+    winner:null,
     chat:[{from:'Système',text:'Salle créée.'}]
   };
 }
@@ -638,12 +648,45 @@ function startGameData(game){
   game.scores[p2.id]=0;
   game.turn=p1.id;
   game.turnEndsAt=nextTurnEndsAt();
+  game.passCount=0;
+  game.gameOver=false;
+  game.winner=null;
   game.chat=[...(game.chat||[]),{from:'Système',text:'La partie commence.'}];
   return game;
 }
 
 function nextTurnEndsAt(){
   return new Date(Date.now()+TURN_SECONDS*1000).toISOString();
+}
+
+function normalizeWord(word){
+  return word
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g,'')
+    .replace(/[^a-zA-Z]/g,'')
+    .toUpperCase();
+}
+
+async function loadDictionary(){
+  if(dictionaryWords)return dictionaryWords;
+  if(!dictionaryPromise){
+    dictionaryPromise=fetch(DICTIONARY_URL)
+      .then(res=>{
+        if(!res.ok)throw new Error('Dictionnaire indisponible');
+        return res.json();
+      })
+      .then(words=>{
+        dictionaryWords=new Set(words.map(normalizeWord).filter(word=>word.length>=2));
+        return dictionaryWords;
+      });
+  }
+  return dictionaryPromise;
+}
+
+async function validateDictionaryWords(words){
+  const dict=await loadDictionary();
+  const invalid=words.map(w=>w.word).filter(word=>!dict.has(normalizeWord(word)));
+  return {ok:invalid.length===0,invalid};
 }
 
 function showConfigError(){
@@ -764,6 +807,9 @@ function applyRemoteGame(game){
   state.scores=game.scores||{};
   state.turnEndsAt=game.turnEndsAt||null;
   state.chat=game.chat||[];
+  state.passCount=game.passCount||0;
+  state.gameOver=!!game.gameOver;
+  state.winner=game.winner||null;
   state.placed=[];state.selectedTileIdx=-1;
   if(!game.started){
     document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Salle prête. En attente d\'un adversaire...';
@@ -1024,6 +1070,24 @@ function recallTiles(){
   document.getElementById('infoRow').textContent='';
 }
 
+function rackValue(rack){
+  return (rack||[]).reduce((sum,tile)=>sum+tile.v,0);
+}
+
+function finishGame(game,winnerId,reason){
+  const players=game.players||[];
+  const remaining={};
+  players.forEach(player=>{remaining[player.id]=rackValue(game.racks[player.id]);});
+  players.forEach(player=>{game.scores[player.id]=(game.scores[player.id]||0)-remaining[player.id];});
+  if(winnerId)game.scores[winnerId]=(game.scores[winnerId]||0)+Object.entries(remaining).filter(([id])=>id!==winnerId).reduce((sum,[,value])=>sum+value,0);
+  game.gameOver=true;
+  game.turn=null;
+  game.turnEndsAt=null;
+  game.winner=players.reduce((best,player)=>!best||game.scores[player.id]>game.scores[best.id]?player:best,null)?.id||null;
+  const winner=players.find(player=>player.id===game.winner);
+  game.chat=[...(game.chat||[]),{from:'Système',text:'Fin de partie : '+reason+'. Gagnant : '+(winner?winner.name:'égalité')+'.'}];
+}
+
 async function playWord(){
   if(!state.placed.length)return;
   if(state.turn!==playerId)return;
@@ -1031,6 +1095,18 @@ async function playWord(){
   if(!analysis.ok){
     document.getElementById('infoRow').textContent=analysis.msg;
     document.getElementById('btnPlay').disabled=true;
+    return;
+  }
+  document.getElementById('infoRow').textContent='Vérification du dictionnaire...';
+  let dictionary;
+  try{
+    dictionary=await validateDictionaryWords(analysis.words);
+  }catch(e){
+    document.getElementById('infoRow').textContent='Dictionnaire indisponible. Réessaie dans quelques secondes.';
+    return;
+  }
+  if(!dictionary.ok){
+    document.getElementById('infoRow').textContent='Mot refusé : '+dictionary.invalid.join(', ');
     return;
   }
   const game=structuredClone(currentRoomRow.game);
@@ -1043,7 +1119,11 @@ async function playWord(){
   for(let i=0;i<n&&game.bag.length;i++)game.racks[playerId].push(game.bag.pop());
   game.turn=state.oppId;
   game.turnEndsAt=nextTurnEndsAt();
+  game.passCount=0;
   game.chat=[...(game.chat||[]),{from:'Système',text:state.myName+' a joué '+analysis.words.map(w=>w.word).join(', ')+' (+'+score+' pts)'}];
+  if(game.bag.length===0&&game.racks[playerId].length===0){
+    finishGame(game,playerId,state.myName+' a vidé son chevalet');
+  }
   state.placed=[];state.selectedTileIdx=-1;
   await saveGame(game);
 }
@@ -1055,11 +1135,43 @@ async function passTurn(){
   game.racks[playerId]=state.rack;
   game.turn=state.oppId;
   game.turnEndsAt=nextTurnEndsAt();
+  game.passCount=(game.passCount||0)+1;
   game.chat=[...(game.chat||[]),{from:'Système',text:state.myName+' a passé son tour.'}];
+  if(game.passCount>=6){
+    finishGame(game,null,'six tours passés consécutivement');
+  }
+  await saveGame(game);
+}
+
+async function exchangeSelectedTiles(){
+  if(state.turn!==playerId||!currentRoomRow)return;
+  if(state.placed.length){document.getElementById('infoRow').textContent='Rappelle les lettres posées avant un échange.';return;}
+  if(state.selectedTileIdx<0){document.getElementById('infoRow').textContent='Sélectionne une lettre à échanger.';return;}
+  const game=structuredClone(currentRoomRow.game);
+  if((game.bag||[]).length<7){document.getElementById('infoRow').textContent='Échange interdit : il faut au moins 7 lettres dans le sac.';return;}
+  const removed=game.racks[playerId].splice(state.selectedTileIdx,1);
+  game.bag=shuffle([...game.bag,...removed]);
+  game.racks[playerId].push(game.bag.pop());
+  game.turn=state.oppId;
+  game.turnEndsAt=nextTurnEndsAt();
+  game.passCount=(game.passCount||0)+1;
+  game.chat=[...(game.chat||[]),{from:'Système',text:state.myName+' a échangé 1 lettre.'}];
+  state.selectedTileIdx=-1;
   await saveGame(game);
 }
 
 function updateUI(){
+  if(state.gameOver){
+    const winnerName=state.winner===playerId?state.myName:(state.winner===state.oppId?state.oppName:'égalité');
+    const badge=document.getElementById('turnBadge');
+    badge.textContent='Partie terminée - '+winnerName;
+    badge.className='turn-badge';
+    document.getElementById('myScore').textContent=state.scores[playerId]||0;
+    document.getElementById('oppScore').textContent=state.scores[state.oppId]||0;
+    document.getElementById('btnPlay').disabled=true;
+    document.getElementById('infoRow').textContent='Score final.';
+    return;
+  }
   const my=state.turn===playerId;
   const badge=document.getElementById('turnBadge');
   badge.textContent=my?'Ton tour !':'Tour de '+state.oppName;
@@ -1071,6 +1183,7 @@ function updateUI(){
 }
 
 function updateTimerText(){
+  if(state.gameOver)return;
   const seconds=state.turnEndsAt?Math.max(0,Math.ceil((new Date(state.turnEndsAt)-Date.now())/1000)):0;
   const min=String(Math.floor(seconds/60)).padStart(2,'0');
   const sec=String(seconds%60).padStart(2,'0');
