@@ -258,6 +258,7 @@ body{
   user-select:none;
 }
 .cell:hover{filter:brightness(0.93)}
+.cell.drop-target{outline:3px solid var(--accent);outline-offset:-3px;filter:brightness(0.92)}
 .cell.tw{background:var(--tw);color:#fff}
 .cell.dw{background:var(--dw);color:#fff}
 .cell.tl{background:var(--tl);color:#fff}
@@ -330,6 +331,7 @@ body{
   box-shadow:0 2px 0 var(--tile-border);
 }
 .tile:hover{transform:translateY(-2px);box-shadow:0 4px 0 var(--tile-border)}
+.tile.dragging{opacity:0.55;transform:translateY(-5px);box-shadow:0 5px 0 var(--accent)}
 .tile.selected{
   transform:translateY(-5px);
   border-color:var(--accent);
@@ -560,6 +562,7 @@ let state={
   scores:{}
 };
 let peer,conn;
+let draggedTileIdx=-1;
 
 function showScreen(id){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
@@ -706,6 +709,12 @@ function renderBoard(){
       } else {
         if(bon)cell.innerHTML='<span class="bonus-label">'+BONUS_LABELS[bon]+'</span>';
         cell.onclick=()=>placeOnCell(r,c);
+        cell.dataset.row=r;
+        cell.dataset.col=c;
+        cell.ondragover=handleCellDragOver;
+        cell.ondragenter=()=>cell.classList.add('drop-target');
+        cell.ondragleave=()=>cell.classList.remove('drop-target');
+        cell.ondrop=e=>dropOnCell(e,r,c);
       }
       board.appendChild(cell);
     }
@@ -721,8 +730,42 @@ function renderRack(){
     el.className='tile'+(tile.l===''?' blank':'')+(i===state.selectedTileIdx?' selected':'');
     el.innerHTML=(tile.l||'*')+'<span class="tile-score">'+tile.v+'</span>';
     el.onclick=()=>selectTile(i);
+    el.draggable=state.turn===state.myName;
+    el.dataset.tileIndex=i;
+    el.ondragstart=e=>startTileDrag(e,i);
+    el.ondragend=e=>endTileDrag(e);
     rack.appendChild(el);
   });
+}
+
+function startTileDrag(e,i){
+  if(state.turn!==state.myName){e.preventDefault();return;}
+  draggedTileIdx=i;
+  state.selectedTileIdx=i;
+  e.currentTarget.classList.add('dragging');
+  e.dataTransfer.effectAllowed='move';
+  e.dataTransfer.setData('text/plain',String(i));
+}
+
+function endTileDrag(e){
+  e.currentTarget.classList.remove('dragging');
+  document.querySelectorAll('.cell.drop-target').forEach(cell=>cell.classList.remove('drop-target'));
+  draggedTileIdx=-1;
+  renderRack();
+}
+
+function handleCellDragOver(e){
+  if(state.turn!==state.myName)return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect='move';
+}
+
+function dropOnCell(e,r,c){
+  e.preventDefault();
+  e.currentTarget.classList.remove('drop-target');
+  const raw=e.dataTransfer.getData('text/plain');
+  const idx=draggedTileIdx>=0?draggedTileIdx:Number(raw);
+  placeOnCell(r,c,idx);
 }
 
 function selectTile(i){
@@ -731,19 +774,21 @@ function selectTile(i){
   renderRack();
 }
 
-function placeOnCell(r,c){
+function placeOnCell(r,c,tileIdx=state.selectedTileIdx){
   if(state.turn!==state.myName)return;
-  if(state.selectedTileIdx<0){document.getElementById('infoRow').textContent='Sélectionne d\'abord une lettre.';return;}
+  if(tileIdx<0){document.getElementById('infoRow').textContent='Sélectionne d\'abord une lettre ou glisse-la sur le plateau.';return;}
+  if(!state.rack[tileIdx])return;
   if(state.placed.find(p=>p.r===r&&p.c===c))return;
-  const tile={...state.rack[state.selectedTileIdx]};
+  const tile={...state.rack[tileIdx]};
   if(tile.l===''){
     const letter=prompt('Quelle lettre pour la tuile blanche ?','');
     if(!letter)return;
     tile.l=letter.toUpperCase()[0];
   }
   state.placed.push({r,c,tile});
-  state.rack.splice(state.selectedTileIdx,1);
+  state.rack.splice(tileIdx,1);
   state.selectedTileIdx=-1;
+  draggedTileIdx=-1;
   renderBoard();renderRack();updateWordPreview();
   document.getElementById('btnPlay').disabled=false;
 }
