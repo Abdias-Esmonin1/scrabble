@@ -455,10 +455,10 @@ body{
   <div class="lobby-wrap">
     <div class="lobby-card">
       <div class="lobby-logo">⏳</div>
-      <p class="lobby-sub">Salle créée ! Envoie ce code à ton ami</p>
+      <p class="lobby-sub" id="waitingTitle">Salle créée ! Envoie ce code à ton ami</p>
       <div class="room-code-display" id="displayCode">----</div>
       <button class="copy-btn" onclick="copyCode()">Copier le code</button>
-      <p style="text-align:center;font-size:14px;color:var(--muted)">
+      <p style="text-align:center;font-size:14px;color:var(--muted)" id="waitingStatus">
         <span class="pulse"></span>En attente d'un adversaire...
       </p>
       <button class="btn-secondary" style="margin-top:1.5rem" onclick="cancelWait()">Annuler</button>
@@ -563,6 +563,21 @@ let state={
 };
 let peer,conn;
 let draggedTileIdx=-1;
+let joinTimeout=null;
+
+const PEER_OPTIONS={
+  host:'0.peerjs.com',
+  port:443,
+  path:'/',
+  secure:true,
+  config:{
+    iceServers:[
+      {urls:'stun:stun.l.google.com:19302'},
+      {urls:'stun:global.stun.twilio.com:3478'}
+    ]
+  },
+  debug:1
+};
 
 function showScreen(id){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
@@ -573,6 +588,10 @@ function genCode(){
   const c='ABCDEFGHJKLMNPQRSTUVWXYZ';
   let r='';for(let i=0;i<4;i++)r+=c[Math.floor(Math.random()*c.length)];
   return r;
+}
+
+function roomPeerId(code){
+  return 'scrabble-'+code.toLowerCase()+'-host';
 }
 
 function shuffle(a){
@@ -589,11 +608,14 @@ function drawTiles(n){
 function createRoom(){
   const name=document.getElementById('nameInput').value.trim();
   if(!name){document.getElementById('lobbyErr').textContent='Entre ton prénom.';return;}
+  document.getElementById('lobbyErr').textContent='';
   state.myName=name;state.isHost=true;
   state.room=genCode();
+  document.getElementById('waitingTitle').textContent='Salle créée ! Envoie ce code à ton ami';
   document.getElementById('displayCode').textContent=state.room;
+  document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Connexion au serveur...';
   showScreen('waitingScreen');
-  initPeer(state.room+'_host');
+  initPeer(roomPeerId(state.room));
 }
 
 function joinRoom(){
@@ -601,11 +623,22 @@ function joinRoom(){
   const code=document.getElementById('codeInput').value.trim().toUpperCase();
   if(!name){document.getElementById('lobbyErr').textContent='Entre ton prénom.';return;}
   if(code.length<2){document.getElementById('lobbyErr').textContent='Entre le code de la salle.';return;}
+  document.getElementById('lobbyErr').textContent='';
   state.myName=name;state.isHost=false;state.room=code;
-  initPeer(null,code+'_host');
+  document.getElementById('waitingTitle').textContent='Connexion à la salle...';
+  document.getElementById('displayCode').textContent=state.room;
+  document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Recherche de la partie...';
+  showScreen('waitingScreen');
+  initPeer(null,roomPeerId(code));
 }
 
-function cancelWait(){if(peer)peer.destroy();showScreen('lobbyScreen');}
+function cancelWait(){
+  if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
+  if(conn)conn.close();
+  if(peer)peer.destroy();
+  conn=null;peer=null;
+  showScreen('lobbyScreen');
+}
 
 function copyCode(){
   const t=document.getElementById('displayCode').textContent;
@@ -616,23 +649,49 @@ function copyCode(){
 }
 
 function initPeer(myPeerId,connectTo){
-  peer=new Peer(myPeerId,{debug:0});
+  if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
+  if(conn)conn.close();
+  if(peer)peer.destroy();
+  conn=null;
+  peer=new Peer(myPeerId,PEER_OPTIONS);
   peer.on('open',()=>{
     if(connectTo){
+      document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Connexion à '+state.room+'...';
       conn=peer.connect(connectTo,{reliable:true});
       setupConn(conn);
+      joinTimeout=setTimeout(()=>{
+        if(!conn||!conn.open){
+          document.getElementById('lobbyErr').textContent='Salle introuvable. Vérifie le code ou demande à ton ami de recréer la salle.';
+          cancelWait();
+        }
+      },12000);
+    } else {
+      document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Salle prête. En attente d\'un adversaire...';
     }
   });
   peer.on('connection',c=>{conn=c;setupConn(c);});
   peer.on('error',err=>{
-    document.getElementById('lobbyErr').textContent='Connexion impossible ('+err.type+'). Vérifie le code.';
+    if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
+    const msg=err&&err.type==='unavailable-id'
+      ? 'Ce code est déjà utilisé. Crée une nouvelle partie.'
+      : 'Connexion impossible ('+(err&&err.type?err.type:'erreur réseau')+'). Vérifie le code.';
+    document.getElementById('lobbyErr').textContent=msg;
     showScreen('lobbyScreen');
   });
 }
 
 function setupConn(c){
-  c.on('open',()=>c.send({type:'hello',name:state.myName}));
+  c.on('open',()=>{
+    if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
+    document.getElementById('waitingStatus').innerHTML='<span class="pulse"></span>Adversaire connecté. Lancement...';
+    c.send({type:'hello',name:state.myName});
+  });
   c.on('data',handleMsg);
+  c.on('error',()=>{
+    if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
+    document.getElementById('lobbyErr').textContent='Connexion à la salle impossible. Vérifie le code et réessaie.';
+    showScreen('lobbyScreen');
+  });
   c.on('close',()=>{
     document.getElementById('connDot').className='dot waiting';
     document.getElementById('connLabel').textContent='Déconnecté';
@@ -876,6 +935,7 @@ function sendChat(){
 }
 
 function leaveGame(){
+  if(joinTimeout){clearTimeout(joinTimeout);joinTimeout=null;}
   if(conn)conn.close();
   if(peer)peer.destroy();
   state={board:Array(15).fill(null).map(()=>Array(15).fill(null)),bag:[],turn:null,myId:null,myName:'',oppId:null,oppName:'',isHost:false,room:'',rack:[],placed:[],selectedTileIdx:-1,scores:{}};
