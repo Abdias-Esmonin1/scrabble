@@ -881,27 +881,138 @@ function placeOnCell(r,c,tileIdx=state.selectedTileIdx){
   state.selectedTileIdx=-1;
   draggedTileIdx=-1;
   renderBoard();renderRack();updateWordPreview();
-  document.getElementById('btnPlay').disabled=false;
 }
 
 function updateWordPreview(){
   if(!state.placed.length){document.getElementById('wordPreview').textContent='';return;}
-  const letters=state.placed.sort((a,b)=>a.r-b.r||a.c-b.c).map(p=>p.tile.l).join('');
-  const pts=calcScore();
-  document.getElementById('wordPreview').textContent=letters+' -> ~'+pts+' pts';
+  const analysis=analyzeMove();
+  if(!analysis.ok){
+    document.getElementById('wordPreview').textContent='';
+    document.getElementById('infoRow').textContent=analysis.msg;
+    document.getElementById('btnPlay').disabled=true;
+    return;
+  }
+  document.getElementById('wordPreview').textContent=analysis.words.map(w=>w.word).join(' + ')+' -> '+analysis.score+' pts';
+  document.getElementById('infoRow').textContent=analysis.msg;
+  document.getElementById('btnPlay').disabled=false;
+}
+
+function boardHasTiles(){
+  return state.board.some(row=>row.some(Boolean));
+}
+
+function placedAt(r,c){
+  return state.placed.find(p=>p.r===r&&p.c===c);
+}
+
+function tileAt(r,c){
+  if(r<0||r>14||c<0||c>14)return null;
+  const placed=placedAt(r,c);
+  return placed?placed.tile:state.board[r][c];
+}
+
+function isNewTile(r,c){
+  return !!placedAt(r,c);
+}
+
+function wordAt(r,c,dr,dc){
+  let sr=r,sc=c;
+  while(tileAt(sr-dr,sc-dc)){sr-=dr;sc-=dc;}
+  const cells=[];
+  let cr=sr,cc=sc;
+  while(tileAt(cr,cc)){
+    cells.push({r:cr,c:cc,tile:tileAt(cr,cc),isNew:isNewTile(cr,cc)});
+    cr+=dr;cc+=dc;
+  }
+  return cells;
+}
+
+function scoreWord(cells){
+  let base=0;
+  let mult=1;
+  cells.forEach(({r,c,tile,isNew})=>{
+    let letterScore=tile.v;
+    if(isNew){
+      const bon=BONUS[r+','+c];
+      if(bon==='tl')letterScore*=3;
+      if(bon==='dl')letterScore*=2;
+      if(bon==='tw')mult*=3;
+      if(bon==='dw'||bon==='center')mult*=2;
+    }
+    base+=letterScore;
+  });
+  return base*mult;
+}
+
+function cellsToWord(cells){
+  return cells.map(cell=>cell.tile.l).join('');
+}
+
+function sameCells(a,b){
+  if(a.length!==b.length)return false;
+  return a.every((cell,i)=>cell.r===b[i].r&&cell.c===b[i].c);
+}
+
+function addWord(words,cells){
+  if(cells.length<2)return;
+  if(words.some(w=>sameCells(w.cells,cells)))return;
+  words.push({word:cellsToWord(cells),cells,score:scoreWord(cells)});
+}
+
+function analyzeMove(){
+  if(!state.placed.length)return {ok:false,msg:'Pose au moins une lettre.',score:0,words:[]};
+  const rows=[...new Set(state.placed.map(p=>p.r))];
+  const cols=[...new Set(state.placed.map(p=>p.c))];
+  if(rows.length>1&&cols.length>1)return {ok:false,msg:'Toutes les lettres doivent être sur la même ligne ou colonne.',score:0,words:[]};
+
+  const firstMove=!boardHasTiles();
+  if(firstMove&&!state.placed.some(p=>p.r===7&&p.c===7)){
+    return {ok:false,msg:'Le premier mot doit passer par la case étoile centrale.',score:0,words:[]};
+  }
+
+  const horizontal=rows.length===1;
+  const vertical=cols.length===1;
+  let dr=0,dc=1;
+  if(vertical&&!horizontal){dr=1;dc=0;}
+  if(horizontal&&vertical){
+    const p=state.placed[0];
+    const h=tileAt(p.r,p.c-1)||tileAt(p.r,p.c+1);
+    const v=tileAt(p.r-1,p.c)||tileAt(p.r+1,p.c);
+    if(v&&!h){dr=1;dc=0;}
+  }
+
+  const line=horizontal?rows[0]:cols[0];
+  const coords=horizontal?state.placed.map(p=>p.c):state.placed.map(p=>p.r);
+  const min=Math.min(...coords);
+  const max=Math.max(...coords);
+  for(let i=min;i<=max;i++){
+    const r=horizontal?line:i;
+    const c=horizontal?i:line;
+    if(!tileAt(r,c))return {ok:false,msg:'Les lettres du mot doivent se toucher, sans trou.',score:0,words:[]};
+  }
+
+  const connected=firstMove||state.placed.some(({r,c})=>
+    state.board[r][c-1]||state.board[r][c+1]||
+    (state.board[r-1]&&state.board[r-1][c])||
+    (state.board[r+1]&&state.board[r+1][c])
+  );
+  if(!connected)return {ok:false,msg:'Le mot doit toucher une lettre déjà posée.',score:0,words:[]};
+
+  const words=[];
+  const anchor=state.placed[0];
+  addWord(words,wordAt(anchor.r,anchor.c,dr,dc));
+  state.placed.forEach(({r,c})=>addWord(words,wordAt(r,c,dc,dr)));
+
+  if(!words.length)return {ok:false,msg:'Un coup doit former au moins un mot de deux lettres.',score:0,words:[]};
+  const bingo=state.placed.length===7?50:0;
+  const score=words.reduce((sum,w)=>sum+w.score,0)+bingo;
+  const msg=bingo?'Scrabble ! Bonus de 50 points.':'Coup valide.';
+  return {ok:true,msg,score,words};
 }
 
 function calcScore(){
-  let base=0,mult=1;
-  state.placed.forEach(({r,c,tile})=>{
-    const bon=BONUS[r+','+c];
-    if(bon==='tl')base+=tile.v*3;
-    else if(bon==='dl')base+=tile.v*2;
-    else base+=tile.v;
-    if(bon==='tw')mult*=3;
-    else if(bon==='dw'||bon==='center')mult*=2;
-  });
-  return base*mult;
+  const analysis=analyzeMove();
+  return analysis.ok?analysis.score:0;
 }
 
 function recallTiles(){
@@ -916,8 +1027,14 @@ function recallTiles(){
 async function playWord(){
   if(!state.placed.length)return;
   if(state.turn!==playerId)return;
+  const analysis=analyzeMove();
+  if(!analysis.ok){
+    document.getElementById('infoRow').textContent=analysis.msg;
+    document.getElementById('btnPlay').disabled=true;
+    return;
+  }
   const game=structuredClone(currentRoomRow.game);
-  const score=calcScore();
+  const score=analysis.score;
   state.placed.forEach(({r,c,tile})=>{game.board[r][c]=tile;});
   game.scores[playerId]=(game.scores[playerId]||0)+score;
   game.bag=state.bag;
@@ -926,7 +1043,7 @@ async function playWord(){
   for(let i=0;i<n&&game.bag.length;i++)game.racks[playerId].push(game.bag.pop());
   game.turn=state.oppId;
   game.turnEndsAt=nextTurnEndsAt();
-  game.chat=[...(game.chat||[]),{from:'Système',text:state.myName+' a joué (+'+score+' pts)'}];
+  game.chat=[...(game.chat||[]),{from:'Système',text:state.myName+' a joué '+analysis.words.map(w=>w.word).join(', ')+' (+'+score+' pts)'}];
   state.placed=[];state.selectedTileIdx=-1;
   await saveGame(game);
 }
