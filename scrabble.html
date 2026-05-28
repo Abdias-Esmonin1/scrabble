@@ -555,7 +555,7 @@ const BONUS_LABELS={tw:'M x3',dw:'M x2',tl:'L x3',dl:'L x2',center:'*'};
 
 const SUPABASE_URL='https://ljdirfcxnvqsmdxzflad.supabase.co';
 const SUPABASE_ANON_KEY='sb_publishable_NEwEz6jFXMRqMgkvRlSDsQ_h8reR4Co';
-const TURN_SECONDS=180;
+const TURN_SECONDS=120;
 const DICTIONARY_URL='https://cdn.jsdelivr.net/npm/an-array-of-french-words@2.0.0/index.json';
 
 const playerId=localStorage.getItem('scrabblePlayerId')||crypto.randomUUID();
@@ -657,6 +657,16 @@ function startGameData(game){
 
 function nextTurnEndsAt(){
   return new Date(Date.now()+TURN_SECONDS*1000).toISOString();
+}
+
+function isTurnExpired(game=currentRoomRow&&currentRoomRow.game){
+  return !!(game&&game.turnEndsAt&&Date.now()>=new Date(game.turnEndsAt).getTime());
+}
+
+function ensureTurnActive(){
+  if(!isTurnExpired())return true;
+  passExpiredTurn();
+  return false;
 }
 
 function normalizeWord(word){
@@ -907,12 +917,14 @@ function dropOnCell(e,r,c){
 
 function selectTile(i){
   if(state.turn!==playerId)return;
+  if(!ensureTurnActive())return;
   state.selectedTileIdx=(state.selectedTileIdx===i)?-1:i;
   renderRack();
 }
 
 function placeOnCell(r,c,tileIdx=state.selectedTileIdx){
   if(state.turn!==playerId)return;
+  if(!ensureTurnActive())return;
   if(tileIdx<0){document.getElementById('infoRow').textContent='Sélectionne d\'abord une lettre ou glisse-la sur le plateau.';return;}
   if(!state.rack[tileIdx])return;
   if(state.placed.find(p=>p.r===r&&p.c===c))return;
@@ -1091,6 +1103,7 @@ function finishGame(game,winnerId,reason){
 async function playWord(){
   if(!state.placed.length)return;
   if(state.turn!==playerId)return;
+  if(!ensureTurnActive())return;
   const analysis=analyzeMove();
   if(!analysis.ok){
     document.getElementById('infoRow').textContent=analysis.msg;
@@ -1130,6 +1143,7 @@ async function playWord(){
 
 async function passTurn(){
   if(state.turn!==playerId)return;
+  if(!ensureTurnActive())return;
   recallTiles();
   const game=structuredClone(currentRoomRow.game);
   game.racks[playerId]=state.rack;
@@ -1143,8 +1157,33 @@ async function passTurn(){
   await saveGame(game);
 }
 
+async function passExpiredTurn(){
+  if(!currentRoomRow||!currentRoomRow.game||autoPassing)return;
+  const game=structuredClone(currentRoomRow.game);
+  if(game.gameOver||!game.turn||!game.turnEndsAt)return;
+  if(Date.now()<new Date(game.turnEndsAt).getTime())return;
+  autoPassing=true;
+  try{
+    const players=game.players||[];
+    const current=players.find(player=>player.id===game.turn);
+    const next=players.find(player=>player.id!==game.turn);
+    if(!next)return;
+    game.turn=next.id;
+    game.turnEndsAt=nextTurnEndsAt();
+    game.passCount=(game.passCount||0)+1;
+    game.chat=[...(game.chat||[]),{from:'Système',text:(current?current.name:'Un joueur')+' a dépassé les 2 minutes. Tour passé.'}];
+    if(game.passCount>=6){
+      finishGame(game,null,'six tours passés consécutivement');
+    }
+    await saveGame(game);
+  } finally {
+    autoPassing=false;
+  }
+}
+
 async function exchangeSelectedTiles(){
   if(state.turn!==playerId||!currentRoomRow)return;
+  if(!ensureTurnActive())return;
   if(state.placed.length){document.getElementById('infoRow').textContent='Rappelle les lettres posées avant un échange.';return;}
   if(state.selectedTileIdx<0){document.getElementById('infoRow').textContent='Sélectionne une lettre à échanger.';return;}
   const game=structuredClone(currentRoomRow.game);
@@ -1184,20 +1223,20 @@ function updateUI(){
 
 function updateTimerText(){
   if(state.gameOver)return;
-  const seconds=state.turnEndsAt?Math.max(0,Math.ceil((new Date(state.turnEndsAt)-Date.now())/1000)):0;
+  const remainingMs=state.turnEndsAt?new Date(state.turnEndsAt).getTime()-Date.now():0;
+  const seconds=Math.max(0,Math.ceil(remainingMs/1000));
   const min=String(Math.floor(seconds/60)).padStart(2,'0');
   const sec=String(seconds%60).padStart(2,'0');
   document.getElementById('infoRow').textContent=state.bag.length+' lettres restantes dans le sac | Temps : '+min+':'+sec;
-  if(seconds===0&&state.turn===playerId&&currentRoomRow&&!autoPassing){
-    autoPassing=true;
-    passTurn().finally(()=>{autoPassing=false;});
+  if(remainingMs<=0&&state.turn&&currentRoomRow&&!autoPassing){
+    passExpiredTurn();
   }
 }
 
 function startTurnTimer(){
   if(turnTimer)clearInterval(turnTimer);
   updateTimerText();
-  turnTimer=setInterval(updateTimerText,1000);
+  turnTimer=setInterval(updateTimerText,250);
 }
 
 function addChat(from,text,persist=false){
