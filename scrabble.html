@@ -220,15 +220,24 @@ body{
 .quit-btn:hover{background:var(--bg)}
 
 .game-body{
-  display:flex;
-  flex-direction:column;
-  gap:10px;
+  display:grid;
+  grid-template-columns:1fr 230px;
+  gap:12px;
   padding:12px;
-  max-width:520px;
+  max-width:900px;
   margin:0 auto;
 }
 @media(max-width:640px){
-  .game-body{padding:8px}
+  .game-body{
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+    padding:8px;
+    max-width:520px;
+  }
+  .board-scroll{order:1}
+  .sidebar{order:2}
+  .rack-panel{order:-1}
 }
 
 /* BOARD */
@@ -501,7 +510,7 @@ body{
           <span class="score-pts" id="oppScore">0</span>
         </div>
       </div>
-      <div class="panel">
+      <div class="panel rack-panel">
         <div class="panel-title">Mon chevalet</div>
         <div class="rack" id="rack"></div>
         <div class="word-preview" id="wordPreview"></div>
